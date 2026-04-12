@@ -1,0 +1,38 @@
+# OCI Configuration
+.oci/
+
+# Environment files
+.env.local
+.env
+
+# Terraform state files (contain sensitive data)
+*.tfstate
+*.tfstate.*
+
+# Terraform working directory
+.terraform/
+
+# Terraform variable files with secrets
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# Terraform plan files
+*.tfplan
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files (local development)
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local working files
+.DS_Store
+*.swp
+*.swo
+*~
