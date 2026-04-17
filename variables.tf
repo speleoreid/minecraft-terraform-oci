@@ -20,7 +20,7 @@ variable "private_key_path" {
 
 variable "region" {
   type        = string
-  default     = "us-ashburn-1"
+  default     = "us-phoenix-1"
 }
 
 variable "compartment_ocid" {
@@ -72,4 +72,16 @@ variable "ssh_authorized_keys" {
   type        = string
   description = "SSH public key for instance access"
   sensitive   = true
+}
+
+variable "minecraft_data_volume_size_gb" {
+  type        = number
+  description = "Size of the Minecraft data volume in GB"
+  default     = 50
+}
+
+variable "reserved_public_ip" {
+  type        = string
+  description = "Reserved public IP address for the instance"
+  default     = "129.146.160.184"
 }
