@@ -23,6 +23,28 @@ variable "region" {
   default     = "us-phoenix-1"
 }
 
+variable "availability_domain" {
+  type        = string
+  description = "Availability Domain for the compute instance"
+  default     = "xIGM:PHX-AD-2"
+}
+
+variable "shape" {
+  type        = string
+  description = "Compute instance shape"
+  default     = "VM.Standard.A1.Flex"
+}
+variable "shape_ocpus" {
+  type        = number
+  description = "Number of OCPUs for the instance shape"
+  default     = 4
+}
+variable "shape_memory_in_gbs" {
+  type        = number
+  description = "Amount of memory in GBs for the instance shape"
+  default     = 24
+}
+
 variable "compartment_ocid" {
   type        = string
   description = "Compartment OCID"
@@ -62,26 +84,44 @@ variable "minecraft_server_ips" {
 variable "ssh_allowed_cidrs" {
   type        = list(string)
   description = "CIDR blocks allowed for SSH access"
-  default     = ["0.0.0.0/0"]
+  default     = ["71.56.204.254/32"]
 }
 
 ############################
 # Compute Configuration
 ############################
+variable "os_image_id" {
+  type        = string
+  description = "OCID of the OS image to use for the Minecraft instance"
+  default     = "ocid1.image.oc1.phx.aaaaaaaazml2pmdmqofihn3g5b7kwogxo5bbo5jxiodx3qtpvn3uvzgja2eq"
+}
+
+
 variable "ssh_authorized_keys" {
   type        = string
   description = "SSH public key for instance access"
   sensitive   = true
 }
 
+# Note: 50 GB is the minimum volume size supported by OCI
 variable "minecraft_data_volume_size_gb" {
   type        = number
   description = "Size of the Minecraft data volume in GB"
   default     = 50
 }
 
-variable "reserved_public_ip" {
+
+############################
+# Budget and Budget Alerting Configuration
+############################
+variable "budget_monthly_usd" {
+  type        = number
+  description = "The monthly budget limit in USD"
+  default     = 5
+}
+
+variable "budget_email_alert" {
   type        = string
-  description = "Reserved public IP address for the instance"
-  default     = "129.146.160.184"
+  description = "Email address to receive budget alerts"
+  default     = "grapnel.gill.3c@icloud.com"
 }
