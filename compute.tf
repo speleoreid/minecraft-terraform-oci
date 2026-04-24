@@ -13,7 +13,7 @@ resource "oci_core_instance" "minecraft_instance" {
   }
 
   create_vnic_details {
-    subnet_id              = oci_core_subnet.subnet-private.id
+    subnet_id              = oci_core_subnet.minecraft_subnet.id
     display_name           = "minecraft-instance"
     hostname_label         = "minecraft-instance"
     assign_public_ip       = true
@@ -37,8 +37,9 @@ resource "oci_core_instance" "minecraft_instance" {
   }
 
   depends_on = [
-    oci_core_route_table_attachment.route-table-attachment,
-    oci_core_security_list_association.security-list-association
+    oci_core_internet_gateway.igw-vcn-minecraft,
+    oci_core_default_route_table.default_route_table,
+    oci_core_default_security_list.default_security_list
   ]
 }
 
