@@ -1,16 +1,26 @@
 #!/bin/bash
 set -e
 
-echo "Sleeping for 5 minutes to allow cloud-init prcesses to complete"
+echo "Sleeping for 5 minutes to allow cloud-init processes to complete"
 sleep 300
 
-# SSH Key for user 'reid' (injected by Terraform)
+# Stop unattended-upgrades if it's running (it holds apt lock on first boot)
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Checking for unattended-upgrades..."
+if systemctl is-active --quiet unattended-upgrades; then
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Stopping unattended-upgrades service..."
+  sudo systemctl stop unattended-upgrades || true
+  sleep 2
+fi
+
+# SSH Key for user (injected by Terraform)
 SSH_AUTHORIZED_KEYS="${ssh_authorized_keys}"
 
-# Minecraft Data Volume Auto-Mount Script
+# Persistent Data Volume Auto-Mount Script
 # This script is executed when the instance first boots (or when an image is updated)
+# Contains: /mnt/persistent-data/minecraft/server (Minecraft server files)
+#           /mnt/persistent-data/nginx/www (nginx web content)
 
-MOUNT_POINT="/mnt/minecraft-data"
+MOUNT_POINT="/mnt/persistent-data"
 DEVICE=""
 LOG_FILE="/var/log/minecraft-volume-setup.log"
 
@@ -20,89 +30,122 @@ exec 2>&1
 
 # Helper function: Wait for apt to be available
 wait_for_apt() {
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Waiting for apt to be available..."
   local max_attempts=60
   local attempt=0
   
   while [ $attempt -lt $max_attempts ]; do
-    # Check if apt processes are running
-    echo "got to 1"
-    apt_processes=$(pgrep -x "apt-get|apt|dpkg" 2>/dev/null || true)
-    echo "got to 2"
-    if [ -z "$apt_processes" ]; then
-      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") [DEBUG] No apt processes found"
-      echo "got to 3"
-      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ apt is available (no processes blocking)"
-      echo "got to 4"
+    # Check for apt/dpkg processes
+    apt_processes=$(pgrep -f "apt-get|apt|unattended-upgrade|dpkg" 2>/dev/null || true)
+    
+    # Check if lock files are held
+    lock_file_check=0
+    for lock in /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock; do
+      if [ -f "$lock" ] 2>/dev/null && fuser "$lock" >/dev/null 2>&1; then
+        lock_file_check=1
+        break
+      fi
+    done
+    
+    if [ -z "$apt_processes" ] && [ $lock_file_check -eq 0 ]; then
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ apt is available"
       return 0
-    else
-      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") [DEBUG] apt processes running: $apt_processes"
     fi
     
-    echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") apt still in use, waiting... (attempt $((attempt+1))/$max_attempts)"
+    # Provide feedback on what's blocking
+    if [ $attempt -eq 0 ]; then
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Waiting for apt to become available..."
+    fi
+    
+    if [ -n "$apt_processes" ]; then
+      # Show more details about the blocking process
+      proc_info=$(ps -p "$apt_processes" -o cmd= 2>/dev/null | head -1 || echo "unknown")
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") [Attempt $((attempt+1))/$max_attempts] Blocked by: $proc_info"
+      
+      # If unattended-upgrades is still running after attempt 3, kill it
+      if [ $attempt -ge 3 ] && echo "$proc_info" | grep -q "unattended-upgrade"; then
+        echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Force-stopping unattended-upgrades..."
+        sudo pkill -9 -f "unattended-upgrade" || true
+        sleep 2
+      fi
+    fi
+    
+    if [ $lock_file_check -eq 1 ]; then
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") [Attempt $((attempt+1))/$max_attempts] Lock files held"
+    fi
+    
     sleep 5
-    echo "got to 5"
     ((attempt++))
-    echo "got to 6"
   done
   
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") WARNING: apt lock timeout after $max_attempts attempts, proceeding anyway"
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") [DEBUG] Current processes: $(ps aux | grep -E 'apt|dpkg' | grep -v grep || echo 'none')"
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") [DEBUG] Lock files: $(ls -la /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* 2>/dev/null || echo 'lock files not found')"
+  # Timeout reached - provide diagnostic info and try emergency cleanup
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") WARNING: apt lock timeout, attempting emergency cleanup"
+  sudo pkill -9 -f "apt|dpkg|unattended" || true
+  sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* || true
+  sleep 2
   return 0
 }
 
-echo "=========================================="
+# Helper function: Retry apt-get operations with network diagnostics
+apt_install() {
+  local max_retries=3
+  local retry=0
+  while [ $retry -lt $max_retries ]; do
+    apt-get install -y "$@" 2>&1 && return 0
+    if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") No network, waiting..."
+      sleep 10
+    fi
+    ((retry++))
+  done
+  return 1
+}
+
 echo "Starting Minecraft Data Volume Setup"
-echo "Timestamp: $(date +"%Y-%m-%dT%H:%M:%S %Z")"
-echo "=========================================="
+
 ############################
-# Create reid User (Early)
+# Create User (Early)
 ############################
 echo ""
-echo "=========================================="
-echo "Creating reid user for SSH access"
-echo "=========================================="
+echo "Creating user for SSH access"
 
-if ! id "reid" &>/dev/null; then
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating reid user..."
-  useradd -m -s /bin/bash -G sudo reid
+ADMIN_USER="${admin_username}"
+
+if ! id "$ADMIN_USER" &>/dev/null; then
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating $ADMIN_USER user..."
+  useradd -m -s /bin/bash -G sudo "$ADMIN_USER"
   
   # Create .ssh directory
-  mkdir -p /home/reid/.ssh
+  mkdir -p /home/$ADMIN_USER/.ssh
   
   # Add SSH public key
-  echo "$SSH_AUTHORIZED_KEYS" > /home/reid/.ssh/authorized_keys
+  echo "$SSH_AUTHORIZED_KEYS" > /home/$ADMIN_USER/.ssh/authorized_keys
   
   # Set proper permissions
-  chmod 700 /home/reid/.ssh
-  chmod 600 /home/reid/.ssh/authorized_keys
-  chown -R reid:reid /home/reid/.ssh
+  chmod 700 /home/$ADMIN_USER/.ssh
+  chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
+  chown -R $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
   
-  # Allow reid to sudo without password (optional, for convenience)
-  echo "reid ALL=(ALL) NOPASSWD:ALL" | tee /etc/sudoers.d/reid > /dev/null
-  chmod 440 /etc/sudoers.d/reid
+  # Allow user to sudo without password (optional, for convenience)
+  echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" | tee /etc/sudoers.d/$ADMIN_USER > /dev/null
+  chmod 440 /etc/sudoers.d/$ADMIN_USER
   
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ reid user created successfully"
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ $ADMIN_USER user created successfully"
 else
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") reid user already exists"
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") $ADMIN_USER user already exists"
 fi
 
-# Function to find the data volume device
+# Function to find the data volume device (formatted or unformatted)
 find_data_volume() {
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Searching for unformatted data volume..." >&2
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Searching for data volume..." >&2
   
   # Wait up to 60 seconds for volume to appear
   for i in {1..30}; do
-    # Look for unformatted volumes (excluding boot volume /dev/sda)
+    # Look for any block devices (excluding boot volume /dev/sda and /dev/sda1, etc)
     for device in /dev/sd{b,c,d,e,f}; do
       if [ -b "$device" ] 2>/dev/null; then
-        # Check if device is already formatted
-        if ! sudo blkid "$device" >/dev/null 2>&1; then
-          echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Found unformatted volume: $device" >&2
-          echo "$device"
-          return 0
-        fi
+        echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Found data volume: $device" >&2
+        echo "$device"
+        return 0
       fi
     done
     
@@ -110,7 +153,7 @@ find_data_volume() {
     sleep 2
   done
   
-  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ERROR: Could not find unformatted data volume" >&2
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ERROR: Could not find data volume" >&2
   return 1
 }
 
@@ -157,7 +200,7 @@ else
 fi
 
 # Create server directory structure
-MINECRAFT_SERVER_DIR="$MOUNT_POINT/server"
+MINECRAFT_SERVER_DIR="$MOUNT_POINT/minecraft/server"
 if [ ! -d "$MINECRAFT_SERVER_DIR" ]; then
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating server directory: $MINECRAFT_SERVER_DIR"
   mkdir -p "$MINECRAFT_SERVER_DIR"
@@ -165,18 +208,7 @@ else
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Server directory already exists"
 fi
 
-# Verify setup
-echo ""
-echo "=========================================="
-echo "Volume Setup Complete!"
-echo "Timestamp: $(date +"%Y-%m-%dT%H:%M:%S %Z")"
-echo "=========================================="
-echo "Mount point: $MOUNT_POINT"
-echo "Device: $DEVICE"
-echo "Mounted filesystems:"
-mount | grep "$DEVICE"
-echo "Disk usage:"
-df -h "$MOUNT_POINT"
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Volume configured on $DEVICE"
 
 
 # Create minecraft user and directories
@@ -186,7 +218,7 @@ echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Setting up Minecraft server service..."
 # Using fixed UID 1003 for consistency across instance recreations
 if ! id "minecraft" &>/dev/null; then
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating minecraft user with fixed UID 1003..."
-  sudo useradd -u 1003 -m -d $MOUNT_POINT/server -s /usr/sbin/nologin minecraft
+  sudo useradd -u 1003 -m -d $MOUNT_POINT/minecraft/server -s /usr/sbin/nologin minecraft
 else
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Minecraft user already exists (UID: $(id -u minecraft))"
 fi
@@ -197,42 +229,44 @@ sudo chmod 755 "$MINECRAFT_SERVER_DIR"
 
 echo ""
 # Install Java (OpenJDK 25 LTS - Temurin)
-echo ""
-echo "=========================================="
-echo "Installing Java (OpenJDK 25 LTS)"
-echo "Timestamp: $(date +"%Y-%m-%dT%H:%M:%S %Z")"
-echo "=========================================="
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing Java 25 LTS..."
 
 # Wait for apt to be available
 wait_for_apt
 
-# Update package manager
-echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Updating package manager..."
-sudo DEBIAN_FRONTEND=noninteractive add-apt-repository -y ppa:openjdk-r/ppa >/dev/null 2>&1
-apt-get update -qq
+# Download and install Java 25 from Eclipse Temurin
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Downloading Java 25 LTS from Eclipse Temurin..."
+cd /tmp
 
-echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing Java 25 (openjdk-25-jre-headless)..."
-apt-get install -y openjdk-25-jre-headless 2>&1
+# Detect architecture (ARM64 or x86_64)
+ARCH=$(uname -m)
+if [[ "$ARCH" == "aarch64" ]]; then
+  JAVA_URL="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1+8/OpenJDK25U-jdk_aarch64_linux_hotspot_25.0.1_8.tar.gz"
+else
+  JAVA_URL="https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1+8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz"
+fi
+
+wget -q "$JAVA_URL" -O java25.tar.gz
+sudo tar -xzf java25.tar.gz -C /opt/
+sudo ln -sf /opt/jdk-25.0.1+8/bin/java /usr/bin/java
+sudo ln -sf /opt/jdk-25.0.1+8/bin/javac /usr/bin/javac
 
 # Verify installation
 JAVA_VERSION=$(java -version 2>&1)
-echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Java installed successfully:"
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Java 25 installed successfully:"
 echo "$JAVA_VERSION"
+cd -
 
-echo ""
-echo "=========================================="
-echo "Minecraft Server Download & Version Check"
-echo "Timestamp: $(date +"%Y-%m-%dT%H:%M:%S %Z")"
-echo "=========================================="
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Setting up Minecraft server..."
 
 # Download and setup initial Minecraft server jar
-MINECRAFT_SERVER_DIR="$MOUNT_POINT/server"
+MINECRAFT_SERVER_DIR="$MOUNT_POINT/minecraft/server"
 
 # Install jq if not present (needed for JSON parsing)
 if ! command -v jq &> /dev/null; then
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing jq for JSON parsing..."
   wait_for_apt
-  apt-get install -y jq 2>&1
+  apt_install jq
 fi
 
 # Check if server.jar already exists
@@ -291,47 +325,18 @@ else
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") eula.txt already exists, skipping"
 fi
 
-# Initialize server if needed (server.properties doesn't exist yet)
-# echo ""
-# echo "=========================================="
-# echo "Server Initialization Check"
-# echo "Timestamp: $(date +"%Y-%m-%dT%H:%M:%S %Z")"
-# echo "=========================================="
+# Detect which jar to use (fabric-server or vanilla server.jar)
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Detecting server jar type..."
+JAR_FILE="server.jar"  # Default to vanilla server.jar
 
-# if [ ! -f "$MINECRAFT_SERVER_DIR/server.properties" ]; then
-#   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") server.properties not found, initializing server..."
-#   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Starting Minecraft server to initialize..."
-
-#   # Start server in background as minecraft user, capture PID
-#   sudo -u minecraft bash -c "cd $MINECRAFT_SERVER_DIR && /usr/bin/java -Xms512M -Xmx1G -jar server.jar nogui &" &
-#   java_pid=$!
-  
-#   # Wait up to 60 seconds for server.properties to be created
-#   max_wait=30
-#   waited=0
-#   while [ ! -f "$MINECRAFT_SERVER_DIR/server.properties" ] && [ $waited -lt $max_wait ]; do
-#     echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Waiting for server.properties... ($waited/$max_wait seconds)"
-#     sleep 2
-#     ((waited++))
-#   done
-  
-#   if [ -f "$MINECRAFT_SERVER_DIR/server.properties" ]; then
-#     echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ server.properties is present, so minecraft server has been initialized."
-#   else
-#     echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") WARNING: server.properties was not created within timeout"
-#   fi
-  
-#   # Kill any remaining java processes for minecraft user
-#   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Stopping initialization server..."
-#   sudo pkill -f "java.*server.jar" -u minecraft || true
-#   sleep 2
-  
-# else
-#   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ server.properties already exists, skipping initialization"
-# fi
-
-# echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Minecraft server setup complete!"
-# echo ""
+# Look for minecraft fabric-server jar files
+FABRIC_JAR=$(ls "$MINECRAFT_SERVER_DIR"/fabric-server*.jar 2>/dev/null | head -1)
+if [ -n "$FABRIC_JAR" ]; then
+  JAR_FILE=$(basename "$FABRIC_JAR")
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Detected Fabric server: $JAR_FILE"
+else
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") No Fabric server found, using vanilla server.jar"
+fi
 
 # Create systemd service file
 echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating systemd service file..."
@@ -342,8 +347,8 @@ After=network.target
 
 [Service]
 User=minecraft
-WorkingDirectory=$MOUNT_POINT/server
-ExecStart=/usr/bin/java -Djava.net.preferIPv4Stack=true -Xms4G -Xmx6G -jar server.jar nogui
+WorkingDirectory=$MOUNT_POINT/minecraft/server
+ExecStart=/usr/bin/java -Djava.net.preferIPv4Stack=true -Xms4G -Xmx6G -jar $JAR_FILE nogui
 Restart=on-failure
 StandardOutput=journal
 StandardError=journal
@@ -364,48 +369,255 @@ echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Minecraft systemd service created successf
 echo ""
 
 # Start the Minecraft service automatically
-echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") qStarting Minecraft service..."
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Starting Minecraft service..."
 sudo systemctl start minecraft.service
 
 # Check service status
 echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Service status:"
 sudo systemctl status minecraft.service
 
-# Configure UFW Firewall
-echo "=========================================="
-echo "Configuring UFW Firewall"
-echo "=========================================="
-
-# Install UFW if not already installed
-echo "Installing UFW..."
-wait_for_apt
-apt-get install -y ufw 2>&1
-
-# Enable UFW
-echo "Enabling UFW..."
-ufw --force enable
-
-# Set default policies
-ufw default deny incoming
-ufw default allow outgoing
-
-# Allow SSH
-echo "Allowing SSH (22/tcp)..."
-ufw allow 22/tcp
-
-# Allow Minecraft (both TCP and UDP)
-echo "Allowing Minecraft (25565/tcp and 25565/udp)..."
-ufw allow 25565/tcp
-ufw allow 25565/udp
-
-# Allow HTTP
-echo "Allowing HTTP (80/tcp)..."
-ufw allow 80/tcp
-
-# Allow HTTPS
-echo "Allowing HTTPS (443/tcp)..."
-ufw allow 443/tcp
-
-echo "UFW Firewall configured successfully"
+# Install and Configure nginx (webserver daemon and required for certbot automation)
 echo ""
-ufw status
+echo "Installing nginx Web Server"
+
+wait_for_apt
+apt_install nginx
+
+# Create document root for nginx on persistent volume
+NGINX_ROOT="$MOUNT_POINT/nginx/www"
+if [ ! -d "$NGINX_ROOT" ]; then
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating nginx document root: $NGINX_ROOT"
+  sudo mkdir -p "$NGINX_ROOT"
+  sudo chmod 755 "$NGINX_ROOT"
+fi
+
+# Create a default index page
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating default nginx index page..."
+sudo tee "$NGINX_ROOT/index.html" > /dev/null <<'NGINX_HTML'
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Minecraft Server</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; background-color: #1a1a1a; color: #fff; }
+    h1 { color: #00ff00; }
+    .server-info { background-color: #2a2a2a; padding: 20px; border-radius: 5px; }
+  </style>
+</head>
+<body>
+  <h1>Minecraft Server</h1>
+  <div class="server-info">
+    <p><strong>Server Status:</strong> Running</p>
+    <p><strong>Port:</strong> 25565</p>
+    <p><strong>Address:</strong> Check your Minecraft server list for the IP</p>
+  </div>
+</body>
+</html>
+NGINX_HTML
+
+# Enable and start nginx
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Enabling nginx service..."
+sudo systemctl enable nginx.service
+sudo systemctl start nginx.service
+
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ nginx web server installed and started"
+
+# Install certbot nginx plugin
+echo ""
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing certbot nginx plugin..."
+apt_install python3-certbot-nginx
+
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ certbot nginx plugin installed"
+echo ""
+
+# Configure UFW Firewall (before HTTPS setup so port 80 is open for validation)
+echo "Configuring UFW Firewall..."
+wait_for_apt
+apt_install ufw
+
+apt-get remove -y iptables-persistent 2>&1||true
+sudo iptables -F&&sudo iptables -X
+sudo iptables -P INPUT ACCEPT&&sudo iptables -P OUTPUT ACCEPT
+ufw --force enable
+ufw default deny incoming&&ufw default allow outgoing
+ufw allow 22/tcp&&ufw allow 25565/tcp&&ufw allow 25565/udp
+ufw allow 80/tcp&&ufw allow 443/tcp&&ufw allow 8100/tcp
+
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Firewall configured"
+
+# Install certbot
+
+# Persist certbot configuration across image refreshes
+# Symlink /etc/letsencrypt to persistent volume so certificates survive rebuilds
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Setting up persistent certificate storage..."
+
+LETSENCRYPT_PERSISTENT="$MOUNT_POINT/letsencrypt"
+
+# Create letsencrypt directory on persistent volume (if it doesn't exist)
+if [ ! -d "$LETSENCRYPT_PERSISTENT" ]; then
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating persistent letsencrypt directory: $LETSENCRYPT_PERSISTENT"
+  sudo mkdir -p "$LETSENCRYPT_PERSISTENT"
+  sudo chmod 700 "$LETSENCRYPT_PERSISTENT"
+else
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Persistent letsencrypt directory already exists"
+fi
+
+# Remove default /etc/letsencrypt if it exists (so we can symlink)
+if [ -d "/etc/letsencrypt" ] && [ ! -L "/etc/letsencrypt" ]; then
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Removing default /etc/letsencrypt directory"
+  sudo rm -rf /etc/letsencrypt
+fi
+
+# Create symlink if it doesn't already exist
+if [ ! -L "/etc/letsencrypt" ]; then
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating symlink: /etc/letsencrypt → $LETSENCRYPT_PERSISTENT"
+  sudo ln -s "$LETSENCRYPT_PERSISTENT" /etc/letsencrypt
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Symlink created"
+else
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Symlink /etc/letsencrypt already exists"
+fi
+
+wait_for_apt
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing certbot..."
+apt_install certbot
+
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ certbot installed successfully"
+
+# Configure certbot renewal hooks
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Configuring certbot renewal hooks..."
+sudo mkdir -p /etc/letsencrypt/renewal-hooks/post
+
+# Enable and verify certbot renewal timer
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Enabling certbot renewal timer..."
+sudo systemctl enable certbot.timer
+sudo systemctl start certbot.timer
+
+# Check timer status
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Certbot renewal timer status:"
+sudo systemctl status certbot.timer --no-pager || echo "Timer may not be available yet"
+
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Certbot setup complete"
+
+# Automatic HTTPS certificate configuration (if domain and email provided)
+# NOW THAT NGINX, PLUGIN, AND FIREWALL ARE CONFIGURED, WE CAN RUN CERTBOT
+# Multi-domain support: comma-separated domains in certbot_domain_name (e.g., "example.com,www.example.com")
+
+if [ -n "${certbot_domain_name}" ] && [ -n "${certbot_email}" ]; then
+  # Extract primary domain (first domain in list) for certificate path
+  PRIMARY_DOMAIN=$(echo "${certbot_domain_name}" | cut -d',' -f1 | xargs)
+  
+  # Check if certificates already exist
+  CERT_PATH="/etc/letsencrypt/live/$PRIMARY_DOMAIN"
+  
+  if [ ! -d "$CERT_PATH" ]; then
+    echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Automatic HTTPS Setup Detected"
+    echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Domains: ${certbot_domain_name}"
+    echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Email: ${certbot_email}"
+    echo ""
+    echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Generating SSL certificate with certbot..."
+    
+    # Build certbot command with all domains
+    # Replace commas and spaces with individual -d flags
+    CERTBOT_CMD="sudo certbot --nginx -m \"${certbot_email}\" --agree-tos --no-eff-email --non-interactive"
+    for domain in $(echo "${certbot_domain_name}" | tr ',' '\n'); do
+      domain=$(echo "$domain" | xargs)
+      CERTBOT_CMD="$CERTBOT_CMD -d \"$domain\""
+    done
+    
+    # Run certbot with all domain arguments
+    eval "$CERTBOT_CMD" 2>&1
+    
+    if [ $? -eq 0 ]; then
+      echo ""
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ HTTPS Certificate Generated Successfully!"
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Your domains are now secured with SSL/TLS"
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Domains: ${certbot_domain_name}"
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Primary access: https://$PRIMARY_DOMAIN"
+      echo ""
+    else
+      echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ⚠ Certificate generation failed - check domains and firewall"
+    fi
+  else
+    echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Certificates already exist for $PRIMARY_DOMAIN"
+  fi
+fi
+
+# Recreate nginx config symlinks for persistent configs
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Setting up persistent nginx configurations..."
+sudo mkdir -p /mnt/persistent-data/nginx/configs
+
+# Configure nginx SSL redirect (create default if not already persisted)
+# Use primary domain from certbot_domain_name if provided, otherwise localhost
+CERT_DOMAIN=$(echo "${certbot_domain_name}" | cut -d',' -f1 | xargs)
+[ -n "$CERT_DOMAIN" ] && CERT_PATH="/etc/letsencrypt/live/$CERT_DOMAIN" || CERT_PATH="/etc/letsencrypt/live/localhost"
+
+if [ ! -f /mnt/persistent-data/nginx/configs/minecraft-ssl ]; then
+  sudo tee /mnt/persistent-data/nginx/configs/minecraft-ssl >/dev/null <<NGINX_SSL
+server {
+    listen 80;
+    listen [::]:80;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    ssl_certificate $CERT_PATH/fullchain.pem;
+    ssl_certificate_key $CERT_PATH/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    root /mnt/persistent-data/nginx/www;
+    # Main site
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+
+}
+
+NGINX_SSL
+  echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Default minecraft-ssl config created"
+fi
+sudo ln -sf /mnt/persistent-data/nginx/configs/minecraft-ssl /etc/nginx/sites-available/minecraft-ssl
+sudo ln -sf /mnt/persistent-data/nginx/configs/minecraft-ssl /etc/nginx/sites-enabled/minecraft-ssl
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t >/dev/null 2>&1&&sudo systemctl reload nginx
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ nginx configured and reloaded"
+
+############################
+# System Updates & Security Patches
+############################
+echo ""
+echo "Installing System Updates & Security Patches"
+
+# Update package cache
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Updating package cache..."
+wait_for_apt
+apt-get update 2>&1
+
+# Upgrade all packages to latest versions (security patches included)
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing all available package updates..."
+apt-get upgrade -y 2>&1
+
+# Distribution upgrade (handles package removals/replacements if needed)
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing distribution updates..."
+apt-get dist-upgrade -y 2>&1
+
+# Auto-remove unnecessary packages and clean apt cache
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Cleaning up unnecessary packages..."
+apt-get autoremove -y 2>&1
+apt-get autoclean 2>&1
+
+echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ System updates and security patches installed successfully"
+echo ""
+
+############################
+# Final Status
+############################
+echo "Minecraft Server Deployment Complete!"
+echo "✓ Deployment Complete - Admin: ${admin_username}"
