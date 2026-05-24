@@ -36,3 +36,6 @@ override.tf.json
 *.swp
 *.swo
 *~
+
+# Local git ignore rules (not shared with public repo)
+.gitignore.local
