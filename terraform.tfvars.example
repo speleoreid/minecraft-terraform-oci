@@ -1,0 +1,125 @@
+# Copy this file to terraform.tfvars and fill in your OCI credentials
+# DO NOT commit terraform.tfvars to git (it contains secrets)
+
+# ======================================
+# OCI Credentials
+# ======================================
+
+# Your OCI tenancy OCID
+# Get it from: OCI Console → Profile → Tenancy → OCID
+tenancy_ocid = "ocid1.tenancy.oc1.your-tenancy-id-here"
+
+# Your OCI user OCID
+# Get it from: OCI Console → Profile → User Settings → User OCID
+user_ocid = "ocid1.user.oc1.your-user-id-here"
+
+# API key fingerprint
+# Get it from: OCI Console → Profile → My Profile → API Keys → Fingerprint
+# Format: ab:cd:ef:12:34:56:78:90:ab:cd:ef:12:34:56:78:90
+api_fingerprint = "ab:cd:ef:12:34:56:78:90:ab:cd:ef:12:34:56:78:90"
+
+# Path to your OCI private API key
+# This is the file you downloaded when creating the API key
+# Typically: ~/.oci/oci_api_key.pem
+private_key_path = "~/.oci/oci_api_key.pem"
+
+# Your OCI region
+# Common options: us-phoenix-1, us-ashburn-1, eu-frankfurt-1, ap-sydney-1
+# See: https://docs.oracle.com/en-us/iaas/Content/General/Concepts/regions.htm
+region = "your_region_here"
+
+# ======================================
+# SSH Configuration
+# ======================================
+
+# Path to your SSH public key
+# This will be added to the ubuntu user's authorized_keys
+# Generate with: ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa
+ssh_public_key_path = "~/.ssh/id_rsa.pub"
+
+# Admin username for SSH access
+# This user will be created on the instance with sudo access
+# IMPORTANT: This will be visible in terraform.tfvars - do NOT commit to git!
+# Use: git update-index --assume-unchanged terraform.tfvars
+# Or add to .gitignore (already done)
+admin_username = "your_admin_username_here"
+
+# ======================================
+# Instance Configuration
+# ======================================
+
+# Instance shape (compute type)
+# For always-free tier: VM.Standard.A1.Flex (ARM64)
+# For paid: VM.Standard.E2.1.Micro, VM.Standard.E2.2, etc.
+instance_shape = "VM.Standard.A1.Flex"
+
+# Number of OCPUs (cores)
+# For always-free: max 4 total across all A1 instances
+# For this single instance: 1 OCPU recommended (leaves room for others)
+instance_ocpus = 4
+
+# RAM in GB
+# For A1 Compute: 6 GB max per 1 OCPU (scales linearly)
+# For 1 OCPU: 6 GB
+# For 2 OCPU: 12 GB max, etc.
+instance_shape_config_memory_in_gbs = 
+
+# ======================================
+# Storage Configuration
+# ======================================
+
+# Size of the Minecraft data volume in GB
+# This volume persists your world data across instance rebuilds
+# Must be: >= 50 GB (recommended) to <= 200 GB (always-free limit)
+minecraft_data_volume_size_gb = 50
+
+# ======================================
+# OS Image (Optional - Advanced Users)
+# ======================================
+
+# Ubuntu 24.04 LTS on ARM64 in us-phoenix-1
+# Leave as-is unless you know what you're doing
+# To find a different image:
+#   1. Run: terraform plan
+#   2. Check output: available_ubuntu_images
+#   3. Copy the id of the image you want
+# os_image_id = "ocid1.image.oc1.phx.aaa..."
+os_image_id = "ocid1.image.oc1.phx.aaaaaaaascalllsjjpj4p2m26zsvvsamafyp4u457i63hb3mfacahmvob7rq"
+
+# ======================================
+# Network Access Control
+# ======================================
+
+# IP addresses allowed to access Minecraft (port 25565)
+# Use CIDR notation (e.g., "www.xxx.yyy.zzz/32" for a single IP, or "www.xxx.0.0/16" for a range)
+# Set to ["0.0.0.0/0"] to allow from anywhere (less secure)
+# Default: Open to everyone
+minecraft_allowed_ips = [
+    "www.xxx.yyy.zzz/32", # Jimmy's house
+    "www.xxx.yyy.zzz/32"  # Fred's house
+    ]
+
+# Example: Restrict to your home IP only
+# minecraft_allowed_ips = ["192.168.2.32/32"]
+
+# Example: Allow multiple IPs or ranges
+# minecraft_allowed_ips = ["192.168.2.32/32", "192.168.1.0/24"]
+
+# ======================================
+# SSL Certificate Configuration (Optional)
+# ======================================
+
+# Automatic HTTPS certificate generation on first deployment
+# If both domain and email are provided, certbot will auto-configure on first boot
+# If left blank, you can configure manually after deployment with:
+#   sudo certbot --nginx -d your-domain.com
+
+# Your domain name (e.g., minecraft.example.com)
+# Make sure this domain is already pointing to your server's IP
+# For multiple domains, separate with commas (e.g., "example.com,www.example.com")
+# This will create a single certificate valid for all specified domains
+# certbot_domain_name = "minecraft.example.com"
+# certbot_domain_name = "example.net,www.example.net"
+
+# Your email address (for Let's Encrypt notifications)
+# certbot_email = "admin@example.com"
