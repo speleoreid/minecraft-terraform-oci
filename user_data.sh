@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-echo "Sleeping for 5 minutes to allow cloud-init processes to complete"
+echo "Sleeping for 5 minutes for cloud-init"
 sleep 300
 
-# Stop unattended-upgrades if it's running (it holds apt lock on first boot)
+# Stop unattended-upgrades
 echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Checking for unattended-upgrades..."
 if systemctl is-active --quiet unattended-upgrades; then
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Stopping unattended-upgrades service..."
@@ -12,13 +12,14 @@ if systemctl is-active --quiet unattended-upgrades; then
   sleep 2
 fi
 
+echo "Sleeping for 5 minutes"
+sleep 300
+
 # SSH Key for user (injected by Terraform)
 SSH_AUTHORIZED_KEYS="${ssh_authorized_keys}"
 
 # Persistent Data Volume Auto-Mount Script
 # This script is executed when the instance first boots (or when an image is updated)
-# Contains: /mnt/persistent-data/minecraft/server (Minecraft server files)
-#           /mnt/persistent-data/nginx/www (nginx web content)
 
 MOUNT_POINT="/mnt/persistent-data"
 DEVICE=""
@@ -77,7 +78,7 @@ wait_for_apt() {
     ((attempt++))
   done
   
-  # Timeout reached - provide diagnostic info and try emergency cleanup
+  # Timeout reached - provide info and try cleanup
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") WARNING: apt lock timeout, attempting emergency cleanup"
   sudo pkill -9 -f "apt|dpkg|unattended" || true
   sudo rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* || true
@@ -103,7 +104,7 @@ apt_install() {
 echo "Starting Minecraft Data Volume Setup"
 
 ############################
-# Create User (Early)
+# Create admin user
 ############################
 echo ""
 echo "Creating user for SSH access"
@@ -120,12 +121,12 @@ if ! id "$ADMIN_USER" &>/dev/null; then
   # Add SSH public key
   echo "$SSH_AUTHORIZED_KEYS" > /home/$ADMIN_USER/.ssh/authorized_keys
   
-  # Set proper permissions
+  # Set permissions
   chmod 700 /home/$ADMIN_USER/.ssh
   chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
   chown -R $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
   
-  # Allow user to sudo without password (optional, for convenience)
+  # Allow user to sudo without password
   echo "$ADMIN_USER ALL=(ALL) NOPASSWD:ALL" | tee /etc/sudoers.d/$ADMIN_USER > /dev/null
   chmod 440 /etc/sudoers.d/$ADMIN_USER
   
@@ -140,7 +141,7 @@ find_data_volume() {
   
   # Wait up to 60 seconds for volume to appear
   for i in {1..30}; do
-    # Look for any block devices (excluding boot volume /dev/sda and /dev/sda1, etc)
+    # Look for any block devices (excluding boot volumes)
     for device in /dev/sd{b,c,d,e,f}; do
       if [ -b "$device" ] 2>/dev/null; then
         echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Found data volume: $device" >&2
@@ -174,7 +175,7 @@ fi
 # Format volume if not already formatted
 # IMPORTANT: This check ensures mkfs only runs on first setup.
 # If the volume is attached to a new instance, this will skip formatting
-# and preserve all existing data. The blkid tool detects existing filesystems.
+# and preserve all existing data.
 if ! sudo blkid "$DEVICE" >/dev/null 2>&1; then
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Formatting $DEVICE with ext4..."
   sudo mkfs.ext4 -F "$DEVICE"
@@ -215,7 +216,7 @@ echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") ✓ Volume configured on $DEVICE"
 echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Setting up Minecraft server service..."
 
 # Create minecraft user if it doesn't exist
-# Using fixed UID 1003 for consistency across instance recreations
+# Using fixed UID 1003
 if ! id "minecraft" &>/dev/null; then
   echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Creating minecraft user with fixed UID 1003..."
   sudo useradd -u 1003 -m -d $MOUNT_POINT/minecraft/server -s /usr/sbin/nologin minecraft
@@ -228,13 +229,12 @@ sudo chown -R minecraft:minecraft "$MINECRAFT_SERVER_DIR"
 sudo chmod 755 "$MINECRAFT_SERVER_DIR"
 
 echo ""
-# Install Java (OpenJDK 25 LTS - Temurin)
+
 echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Installing Java 25 LTS..."
 
-# Wait for apt to be available
 wait_for_apt
 
-# Download and install Java 25 from Eclipse Temurin
+# Install Java 25 from Eclipse Temurin
 echo "$(date +"%Y-%m-%dT%H:%M:%S %Z") Downloading Java 25 LTS from Eclipse Temurin..."
 cd /tmp
 
