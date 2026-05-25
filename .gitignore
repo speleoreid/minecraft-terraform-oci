@@ -4,6 +4,7 @@
 # Environment files
 .env.local
 .env
+nginx_config/
 
 # Terraform state files (contain sensitive data)
 *.tfstate
